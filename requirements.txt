@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-multipart
+tensorflow
+numpy
+pandas
+openpyxl
+pillow
+scikit-learn
+geopy
+ollama
+rapidfuzz
+PyMuPDF==1.24.14

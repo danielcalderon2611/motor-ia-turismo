@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+temp_uploads/
+fichas/
+debug_*.txt
+*.csv
