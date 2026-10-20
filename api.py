@@ -8,7 +8,7 @@ import tensorflow as tf
 import ollama
 
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 from tensorflow.keras.models import Model
 from sklearn.metrics.pairwise import cosine_similarity
@@ -41,7 +41,7 @@ lugares_df = lugares_df.fillna("No disponible")
 
 MODEL_PATH = "models/modelo_mobilenetv2_final.keras"
 EMBEDDINGS_PATH = "fewshot_db/embeddings.pkl"
-EXCEL_PATH = "lugares_turisticos_final.xlsx"
+EXCEL_PATH = EXCEL_LUGARES
 
 IMG_SIZE = (224, 224)
 TOP_K = 5
