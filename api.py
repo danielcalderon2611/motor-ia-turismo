@@ -1,507 +1,577 @@
-import io
-import os
-import uuid
-import pickle
-import numpy as np
-import pandas as pd
-import tensorflow as tf
-import ollama
+"""Motor multimodal para validar atractivos turísticos.
 
-from PIL import Image
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-from tensorflow.keras.models import Model
-from sklearn.metrics.pairwise import cosine_similarity
-from geopy.distance import geodesic
-
-# =========================================
-# FASTAPI
-# =========================================
-
-app = FastAPI(title="API Turismo IA")
-
-# ==========================
-# BASE DE LUGARES TURÍSTICOS
-# ==========================
-
-EXCEL_LUGARES = "lugares_turisticos_app_final_v3.xlsx"
-
-lugares_df = pd.read_excel(EXCEL_LUGARES)
-
-lugares_df.columns = [
-    str(col).strip()
-    for col in lugares_df.columns
-]
-
-lugares_df = lugares_df.fillna("No disponible")
-
-# =========================================
-# CONFIGURACIÓN
-# =========================================
-
-MODEL_PATH = "models/modelo_mobilenetv2_final.keras"
-EMBEDDINGS_PATH = "fewshot_db/embeddings.pkl"
-EXCEL_PATH = EXCEL_LUGARES
-
-IMG_SIZE = (224, 224)
-TOP_K = 5
-MAX_ALTITUDE_DIFF = 300
-
-GEMMA_MODEL = "gemma4:e2b"
-TEMP_DIR = "temp_uploads"
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-# =========================================
-# MAPEO CLASE IA / GEMMA → SUBTIPO GIS
-# =========================================
-
-CLASE_A_SUBTIPOS = {
-    "lago": ["lagos", "lagunas"],
-    "rio": ["ríos", "rios", "corrientes de agua"],
-    "playa": ["playas", "costas"],
-    "bosque": ["bosques", "zonas paisajísticas", "zona paisajística"],
-    "sendero": ["bosques", "zonas paisajísticas", "zona paisajística"],
-    "mirador": ["miradores", "zonas paisajísticas", "zona paisajística"],
-    "montana": ["cerros", "montañas", "cordilleras"],
-    "montaña": ["cerros", "montañas", "cordilleras"],
-    "nevado": ["nevados"],
-    "volcan": ["volcanes"],
-    "volcán": ["volcanes"],
-    "cascada": ["cascadas", "caídas de agua", "caida de agua"],
-    "desierto": ["desiertos", "planicies"],
-    "ruinas": ["sitios arqueológicos", "restos arqueológicos"],
-    "iglesia": ["iglesias", "templos"],
-}
-
-CLASES_GEMMA_VALIDAS = [
-    "bosque",
-    "rio",
-    "lago",
-    "playa",
-    "montana",
-    "montaña",
-    "nevado",
-    "volcan",
-    "volcán",
-    "cascada",
-    "desierto",
-    "ruinas",
-    "sendero",
-    "mirador",
-]
-
-# =========================================
-# LIMPIEZA JSON
-# =========================================
-
-def limpiar_json(obj):
-    if isinstance(obj, dict):
-        return {k: limpiar_json(v) for k, v in obj.items()}
-
-    if isinstance(obj, list):
-        return [limpiar_json(v) for v in obj]
-
-    if isinstance(obj, (np.float32, np.float64)):
-        value = float(obj)
-        return None if np.isnan(value) or np.isinf(value) else value
-
-    if isinstance(obj, (np.int32, np.int64)):
-        return int(obj)
-
-    if isinstance(obj, float):
-        return None if np.isnan(obj) or np.isinf(obj) else obj
-
-    return obj
-
-# =========================================
-# CARGA GLOBAL
-# =========================================
-
-print("Cargando modelo...")
-model = tf.keras.models.load_model(MODEL_PATH)
-
-dummy_input = np.zeros((1, 224, 224, 3))
-model.predict(dummy_input, verbose=0)
-
-embedding_model = Model(
-    inputs=model.inputs,
-    outputs=model.layers[-2].output
-)
-
-print("Cargando embeddings...")
-with open(EMBEDDINGS_PATH, "rb") as f:
-    embeddings_db = pickle.load(f)
-
-class_names = sorted(list(set(item["class"] for item in embeddings_db)))
-print("Clases detectadas:", class_names)
-
-print("Cargando GIS...")
-gis_df = pd.read_excel(EXCEL_PATH)
-gis_df.columns = [str(col).strip() for col in gis_df.columns]
-
-print("API lista.")
-
-# =========================================
-# IMAGEN
-# =========================================
-
-def guardar_imagen_temporal(file_bytes, filename):
-    ext = os.path.splitext(filename)[1]
-
-    if ext == "":
-        ext = ".jpg"
-
-    temp_name = f"{uuid.uuid4()}{ext}"
-    temp_path = os.path.join(TEMP_DIR, temp_name)
-
-    with open(temp_path, "wb") as f:
-        f.write(file_bytes)
-
-    return temp_path
-
-
-def cargar_imagen(file_bytes):
-    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    img = img.resize(IMG_SIZE)
-
-    img_array = np.array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    img_array = preprocess_input(img_array)
-
-    return img_array
-
-# =========================================
-# GEMMA 4 - VALIDADOR OFICIAL TURÍSTICO
-# =========================================
-
-def validar_con_gemma(image_path, predicted_class, confidence, best_class, similarity):
-    prompt = f"""
-Analiza la imagen como validador turístico.
-
-Contexto del sistema:
-- Clase MobileNetV2: {predicted_class}
-- Confianza MobileNetV2: {confidence * 100:.2f}%
-- Clase por embeddings: {best_class}
-- Similitud visual: {similarity * 100:.2f}%
-
-Debes responder exactamente con este formato:
-
-VALIDACION: TURISTICO / NO_TURISTICO / DUDOSO
-CLASE_GEMMA: bosque / rio / lago / playa / montana / nevado / volcan / cascada / desierto / ruinas / sendero / mirador / ciudad / no_turistico / dudoso
-
-Reglas:
-- TURISTICO: paisaje natural, bosque, río, lago, montaña, playa, sendero, mirador, catarata, nevado, volcán, ruinas o atractivo turístico.
-- TURISTICO también aplica si hay personas, siempre que el paisaje sea el elemento principal.
-- NO_TURISTICO: selfie cerrada, comida, carro, mascota, meme, captura de pantalla, documento, interior de casa, publicidad u objeto común.
-- DUDOSO: imagen borrosa, ambigua o difícil de interpretar.
+Combina el modelo CNN de ocho clases, similitud por embeddings, Gemma mediante
+Ollama y validación geográfica/altimétrica contra la base GIS.
 """
 
-    try:
-        response = ollama.chat(
-            model=GEMMA_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                    "images": [image_path],
-                }
-            ],
-        )
+from __future__ import annotations
 
-        text = response["message"]["content"].strip().lower()
+import hashlib
+import io
+import json
+import os
+import pickle
+import threading
+import unicodedata
+import uuid
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any
 
-        validacion = "DUDOSO"
-        clase_gemma = "dudoso"
+import numpy as np
+import ollama
+import pandas as pd
+import tensorflow as tf
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from geopy.distance import geodesic
+from PIL import Image, UnidentifiedImageError
+from starlette.concurrency import run_in_threadpool
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from tensorflow.keras.models import Model
 
-        if "validacion:" in text:
-            linea_validacion = [
-                line for line in text.splitlines()
-                if "validacion:" in line
-            ][0]
 
-            valor = linea_validacion.split(":", 1)[1].strip().upper()
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = Path(os.getenv("TURISMO_MODEL_PATH", BASE_DIR / "models" / "modelo_mobilenetv2_limpio_final.keras"))
+EMBEDDINGS_PATH = Path(os.getenv("TURISMO_EMBEDDINGS_PATH", BASE_DIR / "fewshot_db" / "embeddings_v2.pkl"))
+EXCEL_PATH = Path(os.getenv("TURISMO_GIS_PATH", BASE_DIR / "lugares_turisticos_app_final_v3.xlsx"))
+TEMP_DIR = BASE_DIR / "temp_uploads"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-            if "NO_TURISTICO" in valor:
-                validacion = "NO_TURISTICO"
-            elif "TURISTICO" in valor:
-                validacion = "TURISTICO"
-            elif "DUDOSO" in valor:
-                validacion = "DUDOSO"
+CLASES = ["bosque", "cascada", "desierto", "lago", "montana", "nevado", "playa", "volcan"]
+IMG_SIZE = (224, 224)
+TOP_K = 5
+VECINOS_VOTO = 15
+MAX_ALTITUDE_DIFF = 300.0
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemma4:e2b-it-qat")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+GEMMA_ENABLED = os.getenv("GEMMA_ENABLED", "true").lower() in {"1", "true", "yes", "si"}
+GEMMA_NUM_GPU = int(os.getenv("GEMMA_NUM_GPU", "0"))
+GEMMA_NUM_CTX = int(os.getenv("GEMMA_NUM_CTX", "2048"))
+GEMMA_NUM_BATCH = int(os.getenv("GEMMA_NUM_BATCH", "64"))
+GEMMA_TIMEOUT_SECONDS = float(os.getenv("GEMMA_TIMEOUT_SECONDS", "180"))
+MOTOR_VERSION = "2.2.0"
 
-        if "clase_gemma:" in text:
-            linea_clase = [
-                line for line in text.splitlines()
-                if "clase_gemma:" in line
-            ][0]
+CLASE_A_SUBTIPOS = {
+    "bosque": ["bosques", "zonas paisajisticas", "zona paisajistica"],
+    "cascada": ["cascadas", "caidas de agua", "caida de agua"],
+    "desierto": ["desiertos", "planicies"],
+    "lago": ["lagos", "lagunas"],
+    "montana": ["cerros", "montanas", "cordilleras"],
+    "nevado": ["nevados"],
+    "playa": ["playas", "costas"],
+    "volcan": ["volcanes"],
+}
 
-            clase_gemma = linea_clase.split(":", 1)[1].strip().lower()
+GEMMA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "clase": {"type": "string", "enum": CLASES + ["no_turistico", "dudoso"]},
+        "descripcion_breve": {"type": "string"},
+    },
+    "required": ["clase", "descripcion_breve"],
+    "additionalProperties": False,
+}
 
-        return {
-            "validacion": validacion,
-            "clase_gemma": clase_gemma,
-            "respuesta_cruda": text,
-        }
+app = FastAPI(
+    title="Motor IA de Turismo",
+    version=MOTOR_VERSION,
+    description="CNN + embeddings + Gemma/Ollama + GIS",
+)
 
-    except Exception as e:
-        print("Error Gemma:", e)
 
-        return {
-            "validacion": "DUDOSO",
-            "clase_gemma": "dudoso",
-            "respuesta_cruda": str(e),
-        }
-
-# =========================================
-# ANALIZAR IMAGEN
-# =========================================
-
-def analizar_imagen(img_array):
-    predictions = model.predict(img_array, verbose=0)[0]
-
-    confidence = float(np.max(predictions))
-    predicted_index = int(np.argmax(predictions))
-
-    if predicted_index < len(class_names):
-        predicted_class = class_names[predicted_index]
-    else:
-        predicted_class = "desconocido"
-
-    query_embedding = embedding_model.predict(img_array, verbose=0)[0]
-
-    results = []
-
-    for item in embeddings_db:
-        similarity = cosine_similarity(
-            [query_embedding],
-            [item["embedding"]]
-        )[0][0]
-
-        results.append({
-            "class": item["class"],
-            "file": item["file"],
-            "path": item["path"],
-            "similarity": float(similarity),
-        })
-
-    results = sorted(
-        results,
-        key=lambda x: x["similarity"],
-        reverse=True
+def normalizar_texto(valor: Any) -> str:
+    texto = str(valor).strip().lower()
+    return "".join(
+        caracter
+        for caracter in unicodedata.normalize("NFD", texto)
+        if unicodedata.category(caracter) != "Mn"
     )
 
-    return predicted_class, confidence, results[:TOP_K]
 
-# =========================================
-# GIS
-# =========================================
+def limpiar_json(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(clave): limpiar_json(valor) for clave, valor in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [limpiar_json(valor) for valor in obj]
+    if isinstance(obj, np.generic):
+        return limpiar_json(obj.item())
+    if isinstance(obj, float):
+        return None if np.isnan(obj) or np.isinf(obj) else obj
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    return obj
 
-def parse_radio(value):
+
+def sha256(ruta: Path) -> str:
+    digest = hashlib.sha256()
+    with ruta.open("rb") as archivo:
+        for bloque in iter(lambda: archivo.read(1024 * 1024), b""):
+            digest.update(bloque)
+    return digest.hexdigest()
+
+
+def cargar_recursos():
+    for ruta in (MODEL_PATH, EMBEDDINGS_PATH, EXCEL_PATH):
+        if not ruta.is_file():
+            raise FileNotFoundError(f"Falta un recurso obligatorio: {ruta}")
+
+    print(f"Cargando modelo de 8 clases: {MODEL_PATH}")
+    modelo = tf.keras.models.load_model(MODEL_PATH, compile=False)
+    if int(modelo.output_shape[-1]) != len(CLASES):
+        raise ValueError(f"El modelo tiene {modelo.output_shape[-1]} salidas; se esperaban {len(CLASES)}")
+    extractor = Model(
+        inputs=modelo.inputs,
+        outputs=modelo.get_layer("embedding_dense").output,
+        name="extractor_embeddings",
+    )
+
+    print(f"Cargando embeddings: {EMBEDDINGS_PATH}")
+    with EMBEDDINGS_PATH.open("rb") as archivo:
+        paquete = pickle.load(archivo)
+    if not isinstance(paquete, dict) or paquete.get("version") != 2:
+        raise ValueError("La base de embeddings no corresponde al formato v2")
+    if paquete.get("clases") != CLASES:
+        raise ValueError("El orden de clases de los embeddings no coincide con la API")
+    if paquete.get("modelo_sha256") != sha256(MODEL_PATH):
+        raise ValueError("Los embeddings fueron generados con otro modelo")
+
+    matriz = np.asarray(paquete["embeddings"], dtype=np.float32)
+    labels = np.asarray(paquete["labels"], dtype=str)
+    files = list(paquete["files"])
+    paths = list(paquete["paths"])
+    if matriz.ndim != 2 or matriz.shape[1] != int(paquete["dimension"]):
+        raise ValueError(f"Matriz de embeddings inválida: {matriz.shape}")
+    if not (len(matriz) == len(labels) == len(files) == len(paths)):
+        raise ValueError("Los metadatos de embeddings tienen longitudes incompatibles")
+
+    print(f"Cargando GIS: {EXCEL_PATH}")
+    gis = pd.read_excel(EXCEL_PATH)
+    gis.columns = [str(columna).strip() for columna in gis.columns]
+    requeridas = {"Nombre", "SubTipo", "Latitud", "Longitud", "Altitud"}
+    faltantes = requeridas - set(gis.columns)
+    if faltantes:
+        raise ValueError(f"Faltan columnas GIS: {sorted(faltantes)}")
+    return modelo, extractor, paquete, matriz, labels, files, paths, gis
+
+
+(
+    model,
+    embedding_model,
+    embeddings_db,
+    embeddings_matrix,
+    embedding_labels,
+    embedding_files,
+    embedding_paths,
+    gis_df,
+) = cargar_recursos()
+
+MODEL_LOCK = threading.Lock()
+ollama_client = ollama.Client(host=OLLAMA_HOST, timeout=GEMMA_TIMEOUT_SECONDS)
+print(f"Motor {MOTOR_VERSION} listo. Clases: {CLASES}")
+
+
+def cargar_imagen(file_bytes: bytes) -> np.ndarray:
+    try:
+        with Image.open(io.BytesIO(file_bytes)) as original:
+            imagen = original.convert("RGB").resize(IMG_SIZE, Image.Resampling.LANCZOS)
+    except (UnidentifiedImageError, OSError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="El archivo no es una imagen válida") from error
+    matriz = np.asarray(imagen, dtype=np.float32)
+    return preprocess_input(matriz)[None, ...]
+
+
+def guardar_imagen_temporal(file_bytes: bytes, filename: str | None) -> Path:
+    extension = Path(filename or "imagen.jpg").suffix.lower()
+    if extension not in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}:
+        extension = ".jpg"
+    ruta = TEMP_DIR / f"{uuid.uuid4().hex}{extension}"
+    ruta.write_bytes(file_bytes)
+    return ruta
+
+
+def analizar_imagen(img_array: np.ndarray) -> dict[str, Any]:
+    with MODEL_LOCK:
+        probabilidades = np.asarray(model.predict(img_array, verbose=0)[0], dtype=float)
+        vector = np.asarray(embedding_model.predict(img_array, verbose=0)[0], dtype=np.float32)
+
+    indice = int(np.argmax(probabilidades))
+    clase_cnn = CLASES[indice]
+    confianza = float(probabilidades[indice])
+    vector /= max(float(np.linalg.norm(vector)), 1e-12)
+    similitudes = embeddings_matrix @ vector
+
+    cantidad_voto = min(VECINOS_VOTO, len(similitudes))
+    indices_voto = np.argpartition(similitudes, -cantidad_voto)[-cantidad_voto:]
+    indices_voto = indices_voto[np.argsort(similitudes[indices_voto])[::-1]]
+    votos: dict[str, float] = defaultdict(float)
+    maximos: dict[str, float] = defaultdict(lambda: -1.0)
+    for idx in indices_voto:
+        clase = str(embedding_labels[idx])
+        similitud = float(similitudes[idx])
+        votos[clase] += max(similitud, 0.0)
+        maximos[clase] = max(maximos[clase], similitud)
+    clase_embeddings = max(votos, key=votos.get)
+    similitud_clase = maximos[clase_embeddings]
+
+    cantidad_top = min(TOP_K, len(similitudes))
+    indices_top = np.argpartition(similitudes, -cantidad_top)[-cantidad_top:]
+    indices_top = indices_top[np.argsort(similitudes[indices_top])[::-1]]
+    top = [
+        {
+            "clase": str(embedding_labels[idx]),
+            "archivo": embedding_files[idx],
+            "ruta_dataset": embedding_paths[idx],
+            "similitud": float(similitudes[idx]),
+        }
+        for idx in indices_top
+    ]
+    return {
+        "clase_cnn": clase_cnn,
+        "confianza_cnn": confianza,
+        "clase_embeddings": clase_embeddings,
+        "similitud_embeddings": float(similitud_clase),
+        "top_similares": top,
+        "votos_embeddings": {clase: float(puntaje) for clase, puntaje in sorted(votos.items())},
+    }
+
+
+def extraer_contenido_ollama(respuesta: Any) -> str:
+    mensaje = getattr(respuesta, "message", None)
+    if mensaje is not None:
+        contenido = getattr(mensaje, "content", None)
+        if contenido is not None:
+            return str(contenido)
+    return str(respuesta["message"]["content"])
+
+
+def validar_con_gemma(image_path: Path) -> dict[str, Any]:
+    if not GEMMA_ENABLED:
+        return {
+            "disponible": False,
+            "validacion": "DUDOSO",
+            "clase": "dudoso",
+            "descripcion": "Gemma está deshabilitado por configuración.",
+            "respuesta_cruda": "",
+        }
+
+    prompt = f"""
+Analiza solamente el contenido visual de la imagen y selecciona una sola clase
+dominante. No necesitas reconocer un lugar famoso ni comprobar su ubicación.
+
+Clases permitidas: {', '.join(CLASES)}.
+
+Usa bosque cuando predominen árboles o vegetación forestal aunque exista un
+arroyo. Usa lago solamente para una masa amplia de agua interior. Usa cascada
+cuando exista una caída visible de agua. Si no aparece ninguna clase permitida,
+usa no_turistico. Usa dudoso solamente cuando el contenido no permita decidir.
+
+Responde únicamente con el objeto JSON solicitado.
+""".strip()
+    try:
+        respuesta = ollama_client.chat(
+            model=GEMMA_MODEL,
+            messages=[{"role": "user", "content": prompt, "images": [str(image_path)]}],
+            format=GEMMA_SCHEMA,
+            options={
+                "temperature": 0,
+                "num_gpu": GEMMA_NUM_GPU,
+                "num_ctx": GEMMA_NUM_CTX,
+                "num_batch": GEMMA_NUM_BATCH,
+            },
+            think=False,
+        )
+        texto = extraer_contenido_ollama(respuesta).strip()
+        datos = json.loads(texto)
+        clase = normalizar_texto(datos.get("clase", "dudoso"))
+        descripcion = str(datos.get("descripcion_breve", "")).strip()
+        if clase not in set(CLASES) | {"no_turistico", "dudoso"}:
+            raise ValueError(f"Clase Gemma desconocida: {clase}")
+        if clase in CLASES:
+            validacion = "TURISTICO"
+        elif clase == "no_turistico":
+            validacion = "NO_TURISTICO"
+        else:
+            validacion = "DUDOSO"
+        return {
+            "disponible": True,
+            "validacion": validacion,
+            "clase": clase,
+            "descripcion": descripcion,
+            "respuesta_cruda": texto,
+        }
+    except Exception as error:
+        return {
+            "disponible": False,
+            "validacion": "DUDOSO",
+            "clase": "dudoso",
+            "descripcion": "No fue posible consultar o validar la respuesta de Gemma.",
+            "respuesta_cruda": f"{type(error).__name__}: {error}",
+        }
+
+
+def fusionar_clases(visual: dict[str, Any], gemma: dict[str, Any]) -> dict[str, Any]:
+    senales = [visual["clase_cnn"], visual["clase_embeddings"]]
+    if gemma["disponible"] and gemma["validacion"] == "TURISTICO":
+        senales.append(gemma["clase"])
+    conteo = Counter(senales)
+    maximo = max(conteo.values())
+    empatadas = [clase for clase, cantidad in conteo.items() if cantidad == maximo]
+    clase_final = visual["clase_cnn"] if visual["clase_cnn"] in empatadas else empatadas[0]
+    conflicto_gemma = bool(
+        gemma["disponible"]
+        and gemma["validacion"] == "TURISTICO"
+        and gemma["clase"] != clase_final
+    )
+    return {
+        "clase_final": clase_final,
+        "senales": senales,
+        "acuerdo_visual": int(conteo[clase_final]),
+        "conflicto_gemma": conflicto_gemma,
+    }
+
+
+def parse_radio(value: Any) -> float:
     try:
         if pd.isna(value):
             return 3.0
-
-        return float(
-            str(value)
-            .replace("km", "")
-            .replace("KM", "")
-            .strip()
-        )
-    except:
+        return float(str(value).lower().replace("km", "").strip())
+    except (TypeError, ValueError):
         return 3.0
 
 
-def es_subtipo_compatible(clase, subtipo):
-    clase = str(clase).lower().strip()
-    subtipo = str(subtipo).lower().strip()
-
-    subtipos_validos = CLASE_A_SUBTIPOS.get(clase, [])
-
-    for valido in subtipos_validos:
-        if valido in subtipo:
-            return True
-
-    return False
+def es_subtipo_compatible(clase: str, subtipo: Any) -> bool:
+    texto = normalizar_texto(subtipo)
+    return any(valor in texto for valor in CLASE_A_SUBTIPOS.get(clase, []))
 
 
-def elegir_clase_final_gis(gemma_validacion, clase_gemma, best_class):
-    clase_gemma = str(clase_gemma).lower().strip()
-    best_class = str(best_class).lower().strip()
-
-    if (
-        gemma_validacion == "TURISTICO"
-        and clase_gemma in CLASES_GEMMA_VALIDAS
-    ):
-        return clase_gemma
-
-    return best_class
-
-
-def buscar_gis(clase, lat, lon, alt):
-    candidatos = []
-
+def buscar_gis(clase: str, lat: float, lon: float, alt: float) -> list[dict[str, Any]]:
+    candidatos: list[dict[str, Any]] = []
     for _, row in gis_df.iterrows():
         try:
-            subtipo = row.get("SubTipo")
-
-            if not es_subtipo_compatible(clase, subtipo):
+            if not es_subtipo_compatible(clase, row.get("SubTipo")):
                 continue
-
             if pd.isna(row.get("Latitud")) or pd.isna(row.get("Longitud")):
                 continue
-
             lugar_lat = float(row["Latitud"])
             lugar_lon = float(row["Longitud"])
-
+            distancia = float(geodesic((lat, lon), (lugar_lat, lugar_lon)).km)
+            radio = parse_radio(row.get("Radio"))
             if pd.isna(row.get("Altitud")):
                 lugar_alt = None
                 diferencia_altitud = None
                 altitud_valida = False
             else:
                 lugar_alt = float(row["Altitud"])
-                diferencia_altitud = abs(alt - lugar_alt)
+                diferencia_altitud = abs(float(alt) - lugar_alt)
                 altitud_valida = diferencia_altitud <= MAX_ALTITUDE_DIFF
-
-            radio_km = parse_radio(row.get("Radio"))
-
-            distancia = geodesic(
-                (lat, lon),
-                (lugar_lat, lugar_lon)
-            ).km
-
-            candidatos.append({
-                "nombre": row.get("Nombre"),
-                "subtipo": row.get("SubTipo"),
-                "departamento": row.get("Departamento"),
-                "provincia": row.get("Provincia"),
-                "distrito": row.get("Distrito"),
-                "latitud": lugar_lat,
-                "longitud": lugar_lon,
-                "altitud": lugar_alt,
-                "radio_km": radio_km,
-                "distancia_km": round(distancia, 3),
-                "diferencia_altitud_m": (
-                    round(diferencia_altitud, 2)
-                    if diferencia_altitud is not None
-                    else None
-                ),
-                "dentro_radio": distancia <= radio_km,
-                "altitud_valida": altitud_valida,
-                "subtipo_compatible": True,
-            })
-
-        except Exception:
+            candidatos.append(
+                {
+                    "nombre": row.get("Nombre"),
+                    "subtipo": row.get("SubTipo"),
+                    "departamento": row.get("Departamento"),
+                    "provincia": row.get("Provincia"),
+                    "distrito": row.get("Distrito"),
+                    "latitud": lugar_lat,
+                    "longitud": lugar_lon,
+                    "altitud": lugar_alt,
+                    "radio_km": radio,
+                    "distancia_km": round(distancia, 3),
+                    "diferencia_altitud_m": round(diferencia_altitud, 2) if diferencia_altitud is not None else None,
+                    "dentro_radio": distancia <= radio,
+                    "altitud_valida": altitud_valida,
+                    "subtipo_compatible": True,
+                }
+            )
+        except (TypeError, ValueError):
             continue
+    return sorted(candidatos, key=lambda candidato: candidato["distancia_km"])
 
-    candidatos = sorted(
-        candidatos,
-        key=lambda x: x["distancia_km"]
+
+def elegir_lugar(candidatos: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next(
+        (
+            candidato
+            for candidato in candidatos
+            if candidato["dentro_radio"] and candidato["altitud_valida"]
+        ),
+        None,
     )
 
-    return candidatos
 
-# =========================================
-# SCORE MULTIMODAL
-# =========================================
+def calcular_score(
+    visual: dict[str, Any],
+    fusion: dict[str, Any],
+    gemma: dict[str, Any],
+    lugar: dict[str, Any] | None,
+) -> tuple[int, dict[str, int]]:
+    confianza = visual["confianza_cnn"]
+    score_cnn = 20 if confianza >= 0.95 else 16 if confianza >= 0.85 else 12 if confianza >= 0.70 else 6 if confianza >= 0.50 else 0
+    similitud = visual["similitud_embeddings"]
+    score_similitud = 20 if similitud >= 0.95 else 16 if similitud >= 0.90 else 12 if similitud >= 0.85 else 6 if similitud >= 0.75 else 0
+    acuerdo = fusion["acuerdo_visual"]
+    score_acuerdo = 15 if acuerdo >= 3 else 10 if acuerdo == 2 else 0
+    score_distancia = 0
+    score_altitud = 0
+    score_gis = 0
+    if lugar:
+        distancia = lugar["distancia_km"]
+        score_distancia = 20 if distancia <= 1 else 15 if distancia <= 3 else 10
+        diferencia = lugar.get("diferencia_altitud_m")
+        if diferencia is not None:
+            score_altitud = 10 if diferencia <= 50 else 7 if diferencia <= 150 else 5
+        score_gis = 10
+    score_gemma = 0
+    if gemma["disponible"] and gemma["validacion"] == "TURISTICO":
+        score_gemma = 5 if not fusion["conflicto_gemma"] else 2
+    detalle = {
+        "cnn_confidence": score_cnn,
+        "visual_similarity": score_similitud,
+        "visual_agreement": score_acuerdo,
+        "gps_distance": score_distancia,
+        "altitude": score_altitud,
+        "gis_validation": score_gis,
+        "gemma_validation": score_gemma,
+    }
+    return int(sum(detalle.values())), detalle
 
-def calcular_score_multimodal(confidence, best_similarity, lugar_registrado, gemma_validacion):
-    score_total = 0
-    detalle_score = {}
 
-    confidence_percent = confidence * 100
-    similarity_percent = best_similarity * 100
+def decidir_estado(
+    visual: dict[str, Any],
+    fusion: dict[str, Any],
+    gemma: dict[str, Any],
+    lugar: dict[str, Any] | None,
+    score: int,
+) -> tuple[str, str]:
+    if not gemma["disponible"]:
+        return (
+            "CASO_DUDOSO",
+            "CNN, embeddings y GIS fueron evaluados, pero Gemma no está disponible; no se emitirá una decisión automática completa.",
+        )
+    if gemma["validacion"] == "NO_TURISTICO":
+        if lugar and fusion["acuerdo_visual"] >= 2:
+            return (
+                "CASO_DUDOSO",
+                "Gemma considera la imagen no turística, pero existe evidencia visual y GIS; se requiere revisión.",
+            )
+        return "IMAGEN_NO_VALIDA", "Gemma no detectó un paisaje o atractivo turístico válido."
+    if gemma["validacion"] == "DUDOSO":
+        return "CASO_DUDOSO", "Gemma consideró ambigua la imagen."
+    if fusion["conflicto_gemma"]:
+        return "CASO_DUDOSO", "Gemma y los clasificadores visuales no coinciden en la clase dominante."
+    if lugar and fusion["acuerdo_visual"] >= 2 and score >= 70:
+        return (
+            "LUGAR_REGISTRADO",
+            "Existe acuerdo visual y coincidencia geográfica y altimétrica con un lugar registrado.",
+        )
+    if not lugar and fusion["acuerdo_visual"] >= 2 and score >= 45:
+        return (
+            "POSIBLE_NUEVO_ATRACTIVO",
+            "La imagen es turísticamente coherente, pero no coincide con un lugar GIS cercano.",
+        )
+    return (
+        "CASO_DUDOSO",
+        "La evidencia visual, semántica o geográfica no es suficiente para decidir automáticamente.",
+    )
 
-    # CNN: 25 puntos
-    if confidence_percent >= 90:
-        score_cnn = 25
-    elif confidence_percent >= 80:
-        score_cnn = 20
-    elif confidence_percent >= 70:
-        score_cnn = 15
-    elif confidence_percent >= 60:
-        score_cnn = 10
-    else:
-        score_cnn = 0
 
-    score_total += score_cnn
-    detalle_score["cnn_confidence"] = score_cnn
+def procesar_imagen(file_bytes: bytes, filename: str, lat: float, lon: float, alt: float) -> dict[str, Any]:
+    img_array = cargar_imagen(file_bytes)
+    temporal = guardar_imagen_temporal(file_bytes, filename)
+    try:
+        visual = analizar_imagen(img_array)
+        gemma = validar_con_gemma(temporal)
+        fusion = fusionar_clases(visual, gemma)
+        candidatos = buscar_gis(fusion["clase_final"], lat, lon, alt)
+        lugar = elegir_lugar(candidatos)
+        score, detalle = calcular_score(visual, fusion, gemma, lugar)
+        estado, motivo = decidir_estado(visual, fusion, gemma, lugar, score)
+        return limpiar_json(
+            {
+                "version_motor": MOTOR_VERSION,
+                "archivo": filename,
+                "estado": estado,
+                "motivo_decision": motivo,
+                "motor_completo": bool(gemma["disponible"]),
+                "score_total": score,
+                "detalle_score": detalle,
+                "clasificacion_modelo": visual["clase_cnn"],
+                "confianza_modelo": round(visual["confianza_cnn"] * 100, 2),
+                "clase_embeddings": visual["clase_embeddings"],
+                "similitud_visual": round(visual["similitud_embeddings"] * 100, 2),
+                "gemma": gemma,
+                "fusion": fusion,
+                "clase_final_gis": fusion["clase_final"],
+                "gps_usuario": {"latitud": lat, "longitud": lon, "altitud": alt},
+                "lugar_registrado": lugar,
+                "top_similares": [
+                    {**resultado, "similitud": round(resultado["similitud"] * 100, 2)}
+                    for resultado in visual["top_similares"]
+                ],
+                "candidatos_gis": candidatos[:5],
+            }
+        )
+    finally:
+        temporal.unlink(missing_ok=True)
 
-    # Similaridad visual: 25 puntos
-    if similarity_percent >= 95:
-        score_similarity = 25
-    elif similarity_percent >= 90:
-        score_similarity = 20
-    elif similarity_percent >= 85:
-        score_similarity = 15
-    elif similarity_percent >= 75:
-        score_similarity = 10
-    else:
-        score_similarity = 0
 
-    score_total += score_similarity
-    detalle_score["visual_similarity"] = score_similarity
+def estado_ollama() -> dict[str, Any]:
+    if not GEMMA_ENABLED:
+        return {
+            "servicio_disponible": False,
+            "modelo_configurado": GEMMA_MODEL,
+            "modelo_instalado": False,
+            "detalle": "Gemma deshabilitado mediante GEMMA_ENABLED.",
+        }
+    try:
+        respuesta = ollama_client.list()
+        modelos = getattr(respuesta, "models", None)
+        if modelos is None and isinstance(respuesta, dict):
+            modelos = respuesta.get("models", [])
+        nombres = []
+        for item in modelos or []:
+            nombre = getattr(item, "model", None)
+            if nombre is None and isinstance(item, dict):
+                nombre = item.get("model") or item.get("name")
+            if nombre:
+                nombres.append(str(nombre))
+        return {
+            "servicio_disponible": True,
+            "modelo_configurado": GEMMA_MODEL,
+            "modelo_instalado": GEMMA_MODEL in nombres,
+            "modelos_disponibles": nombres,
+        }
+    except Exception as error:
+        return {
+            "servicio_disponible": False,
+            "modelo_configurado": GEMMA_MODEL,
+            "modelo_instalado": False,
+            "detalle": f"{type(error).__name__}: {error}",
+        }
 
-    # Distancia GPS: 20 puntos
-    score_distance = 0
-
-    if lugar_registrado:
-        distancia = lugar_registrado.get("distancia_km")
-
-        if distancia is not None:
-            if distancia <= 1:
-                score_distance = 20
-            elif distancia <= 3:
-                score_distance = 15
-            elif distancia <= 10:
-                score_distance = 10
-            elif distancia <= 30:
-                score_distance = 5
-
-    score_total += score_distance
-    detalle_score["gps_distance"] = score_distance
-
-    # Altitud: 10 puntos
-    score_altitude = 0
-
-    if lugar_registrado:
-        diff_alt = lugar_registrado.get("diferencia_altitud_m")
-
-        if diff_alt is not None:
-            if diff_alt <= 50:
-                score_altitude = 10
-            elif diff_alt <= 150:
-                score_altitude = 7
-            elif diff_alt <= 300:
-                score_altitude = 5
-
-    score_total += score_altitude
-    detalle_score["altitude"] = score_altitude
-
-    # GIS: 10 puntos
-    score_gis = 10 if lugar_registrado else 0
-    score_total += score_gis
-    detalle_score["gis_validation"] = score_gis
-
-    # Gemma: 10 puntos
-    if gemma_validacion == "TURISTICO":
-        score_gemma = 10
-    elif gemma_validacion == "DUDOSO":
-        score_gemma = 5
-    else:
-        score_gemma = 0
-
-    score_total += score_gemma
-    detalle_score["gemma_validation"] = score_gemma
-
-    return score_total, detalle_score
-
-# =========================================
-# RUTAS
-# =========================================
 
 @app.get("/")
 def inicio():
     return {
-        "mensaje": "API Turismo IA funcionando"
+        "mensaje": "Motor IA de Turismo funcionando",
+        "version": MOTOR_VERSION,
+        "clases": CLASES,
+        "documentacion": "/docs",
+        "salud": "/health",
+    }
+
+
+@app.get("/health")
+def health():
+    gemma = estado_ollama()
+    return {
+        "estado": "OK" if gemma["servicio_disponible"] and gemma["modelo_instalado"] else "DEGRADADO",
+        "modelo_cnn": MODEL_PATH.name,
+        "salidas_modelo": int(model.output_shape[-1]),
+        "embeddings": int(len(embeddings_matrix)),
+        "dimension_embeddings": int(embeddings_matrix.shape[1]),
+        "lugares_gis": int(len(gis_df)),
+        "gemma": gemma,
     }
 
 
@@ -512,200 +582,55 @@ async def predict_image(
     lon: float = Form(...),
     alt: float = Form(...),
 ):
-    file_bytes = await file.read()
-    temp_path = guardar_imagen_temporal(file_bytes, file.filename)
-
-    try:
-        img_array = cargar_imagen(file_bytes)
-
-        predicted_class, confidence, top_results = analizar_imagen(img_array)
-
-        best_result = top_results[0]
-        best_class = best_result["class"]
-        best_similarity = best_result["similarity"]
-
-        gemma_resultado = validar_con_gemma(
-            temp_path,
-            predicted_class,
-            confidence,
-            best_class,
-            best_similarity,
-        )
-
-        gemma_validacion = gemma_resultado["validacion"]
-        clase_gemma = gemma_resultado["clase_gemma"]
-
-        clase_final_gis = elegir_clase_final_gis(
-            gemma_validacion,
-            clase_gemma,
-            best_class,
-        )
-
-        candidatos_gis = buscar_gis(
-            clase_final_gis,
-            lat,
-            lon,
-            alt,
-        )
-
-        lugar_registrado = None
-
-        for candidato in candidatos_gis:
-            if candidato["dentro_radio"] and candidato["altitud_valida"]:
-                lugar_registrado = candidato
-                break
-
-        score_total, detalle_score = calcular_score_multimodal(
-            confidence,
-            best_similarity,
-            lugar_registrado,
-            gemma_validacion,
-        )
-        if gemma_validacion == "NO_TURISTICO":
-            estado = "IMAGEN_NO_VALIDA"
-            motivo = "Gemma 4 validó que la imagen no corresponde a un entorno turístico o paisajístico."
-
-        elif gemma_validacion == "DUDOSO" and score_total < 70:
-            estado = "CASO_DUDOSO"
-            motivo = "Gemma 4 consideró la imagen ambigua y el score no fue suficiente para aceptarla automáticamente."
-
-        elif score_total >= 85:
-            estado = "LUGAR_REGISTRADO"
-            motivo = "La imagen coincide visual, geográfica y topográficamente con un atractivo turístico registrado."
-
-        elif lugar_registrado and gemma_validacion == "TURISTICO" and score_total >= 70:
-             estado = "LUGAR_REGISTRADO"
-             motivo = "Gemma 4 validó la imagen como turística y existe coincidencia geoespacial con un lugar registrado."
-
-        # NUEVA REGLA
-        elif gemma_validacion == "TURISTICO" and lugar_registrado is None:
-            estado = "POSIBLE_NUEVO_ATRACTIVO"
-            motivo = "Gemma 4 validó la imagen como turística, pero no existe coincidencia geográfica cercana en la base registrada."
-
-        else:
-            estado = "IMAGEN_NO_VALIDA"
-            motivo = "La imagen no presenta suficiente coherencia visual, geográfica o semántica."
-
-        respuesta = {
-            "archivo": file.filename,
-            "estado": estado,
-            "motivo_decision": motivo,
-            "score_total": score_total,
-            "detalle_score": detalle_score,
-            "gemma_validacion": gemma_validacion,
-            "clase_visual_gemma": clase_gemma,
-            "clase_final_gis": clase_final_gis,
-            "gemma_respuesta_cruda": gemma_resultado["respuesta_cruda"],
-            "clasificacion_modelo": predicted_class,
-            "confianza_modelo": round(confidence * 100, 2),
-            "mejor_clase_visual": best_class,
-            "similitud_visual": round(best_similarity * 100, 2),
-            "gps_usuario": {
-                "latitud": lat,
-                "longitud": lon,
-                "altitud": alt,
-            },
-            "lugar_registrado": lugar_registrado,
-            "top_similares": [
-                {
-                    "clase": r["class"],
-                    "archivo": r["file"],
-                    "similitud": round(r["similarity"] * 100, 2),
-                }
-                for r in top_results
-            ],
-            "candidatos_gis": candidatos_gis[:5],
-        }
-
-        return limpiar_json(respuesta)
-
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-@app.get("/lugares")
-def listar_lugares():
-
-    columnas = [
-        "Código",
-        "Nombre",
-        "Departamento",
-        "Provincia",
-        "Distrito",
-        "Latitud",
-        "Longitud",
-    ]
-
-    columnas_existentes = [
-        c for c in columnas
-        if c in lugares_df.columns
-    ]
-
-    data = lugares_df[
-        columnas_existentes
-    ].to_dict(
-        orient="records"
+    if not -90 <= lat <= 90:
+        raise HTTPException(status_code=422, detail="La latitud debe estar entre -90 y 90")
+    if not -180 <= lon <= 180:
+        raise HTTPException(status_code=422, detail="La longitud debe estar entre -180 y 180")
+    if not -500 <= alt <= 9000:
+        raise HTTPException(status_code=422, detail="La altitud debe estar entre -500 y 9000 m")
+    contenido = await file.read(MAX_UPLOAD_BYTES + 1)
+    if not contenido:
+        raise HTTPException(status_code=400, detail="El archivo está vacío")
+    if len(contenido) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="La imagen supera el máximo de 15 MB")
+    return await run_in_threadpool(
+        procesar_imagen,
+        contenido,
+        file.filename or "imagen",
+        lat,
+        lon,
+        alt,
     )
 
-    return {
-        "total": len(data),
-        "lugares": data
-    }            
-@app.get("/lugares/{codigo}")
-def obtener_lugar(codigo: int):
 
-    if "Código" not in lugares_df.columns:
-        raise HTTPException(
-            status_code=500,
-            detail="No existe columna Código"
-        )
+@app.get("/lugares")
+def listar_lugares():
+    columnas = ["Código", "Nombre", "Departamento", "Provincia", "Distrito", "Latitud", "Longitud"]
+    existentes = [columna for columna in columnas if columna in gis_df.columns]
+    return limpiar_json({"total": int(len(gis_df)), "lugares": gis_df[existentes].to_dict(orient="records")})
 
-    lugar = lugares_df[
-        lugares_df["Código"] == codigo
-    ]
 
-    if lugar.empty:
-        raise HTTPException(
-            status_code=404,
-            detail="Lugar no encontrado"
-        )
-
-    return lugar.iloc[0].to_dict()
 @app.get("/lugares/buscar/{texto}")
 def buscar_lugares(texto: str):
-    texto = texto.lower().strip()
+    consulta = texto.strip()
+    if not consulta:
+        raise HTTPException(status_code=422, detail="La búsqueda no puede estar vacía")
+    mascara = pd.Series(False, index=gis_df.index)
+    for columna in ("Nombre", "Departamento", "Provincia", "Distrito", "SubTipo"):
+        if columna in gis_df.columns:
+            mascara |= gis_df[columna].astype(str).str.contains(consulta, case=False, na=False, regex=False)
+    columnas = ["Código", "Nombre", "Departamento", "Provincia", "Distrito", "SubTipo", "Latitud", "Longitud"]
+    existentes = [columna for columna in columnas if columna in gis_df.columns]
+    data = gis_df.loc[mascara, existentes].to_dict(orient="records")
+    return limpiar_json({"busqueda": consulta, "total": len(data), "resultados": data})
 
-    resultados = lugares_df[
-        lugares_df["Nombre"].astype(str).str.lower().str.contains(texto, na=False)
-        |
-        lugares_df["Departamento"].astype(str).str.lower().str.contains(texto, na=False)
-        |
-        lugares_df["Provincia"].astype(str).str.lower().str.contains(texto, na=False)
-        |
-        lugares_df["Distrito"].astype(str).str.lower().str.contains(texto, na=False)
-        |
-        lugares_df["SubTipo"].astype(str).str.lower().str.contains(texto, na=False)
-    ]
 
-    columnas = [
-        "Código",
-        "Nombre",
-        "Departamento",
-        "Provincia",
-        "Distrito",
-        "SubTipo",
-        "Latitud",
-        "Longitud",
-    ]
-
-    columnas_existentes = [
-        c for c in columnas
-        if c in lugares_df.columns
-    ]
-
-    data = resultados[columnas_existentes].to_dict(orient="records")
-
-    return {
-        "busqueda": texto,
-        "total": len(data),
-        "resultados": data
-    }
+@app.get("/lugares/{codigo}")
+def obtener_lugar(codigo: int):
+    if "Código" not in gis_df.columns:
+        raise HTTPException(status_code=500, detail="No existe la columna Código")
+    codigos = pd.to_numeric(gis_df["Código"], errors="coerce")
+    lugar = gis_df[codigos == codigo]
+    if lugar.empty:
+        raise HTTPException(status_code=404, detail="Lugar no encontrado")
+    return limpiar_json(lugar.iloc[0].to_dict())

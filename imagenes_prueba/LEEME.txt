@@ -1,0 +1,9 @@
+Coloca en esta carpeta las imagenes que quieras probar.
+
+Formatos admitidos: JPG, JPEG, PNG, BMP, GIF y WEBP.
+
+Para procesar todas las imagenes de esta carpeta:
+  & '.venv/Scripts/python.exe' 'probar_modelo.py'
+
+Para procesar solamente una imagen:
+  & '.venv/Scripts/python.exe' 'probar_modelo.py' 'nombre_imagen.jpg'

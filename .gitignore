@@ -5,3 +5,10 @@ temp_uploads/
 fichas/
 debug_*.txt
 *.csv
+*.log
+.env
+.pytest_cache/
+.idea/
+.vscode/
+imagenes_prueba/*
+!imagenes_prueba/LEEME.txt

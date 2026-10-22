@@ -1,0 +1,10 @@
+fastapi==0.146.0
+uvicorn==0.54.0
+python-multipart==0.0.32
+tensorflow==2.21.0
+numpy==2.5.4
+pandas==3.0.6
+openpyxl==3.1.5
+pillow==13.0.0
+geopy==2.5.0
+ollama==0.6.3

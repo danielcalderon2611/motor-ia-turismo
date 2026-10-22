@@ -1,0 +1,49 @@
+name: motor-ia-turismo
+
+services:
+  ollama:
+    image: ollama/ollama:0.40.6
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  ollama-init:
+    image: ollama/ollama:0.40.6
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/ollama"]
+    command: ["pull", "${GEMMA_MODEL:-gemma4:e2b-it-qat}"]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      GEMMA_MODEL: ${GEMMA_MODEL:-gemma4:e2b-it-qat}
+      GEMMA_ENABLED: ${GEMMA_ENABLED:-true}
+      GEMMA_NUM_GPU: ${GEMMA_NUM_GPU:-0}
+      GEMMA_NUM_CTX: ${GEMMA_NUM_CTX:-2048}
+      GEMMA_NUM_BATCH: ${GEMMA_NUM_BATCH:-64}
+      GEMMA_TIMEOUT_SECONDS: ${GEMMA_TIMEOUT_SECONDS:-300}
+    stop_grace_period: 30s
+
+volumes:
+  ollama_data:
