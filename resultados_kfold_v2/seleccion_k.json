@@ -1,0 +1,29 @@
+{
+  "criterio_principal": "mayor F1 macro promedio",
+  "desempate": "mayor accuracy promedio",
+  "k_seleccionado": 3,
+  "comparacion": [
+    {
+      "k": 3,
+      "accuracy_media": 0.9398481131116482,
+      "accuracy_desviacion": 0.003565689667734846,
+      "precision_macro_media": 0.9389428393962819,
+      "recall_macro_media": 0.9376370975156214,
+      "f1_macro_media": 0.9374442515694085,
+      "f1_macro_desviacion": 0.004242970985906408,
+      "roc_auc_macro_media": 0.9976266934466475,
+      "roc_auc_macro_desviacion": 0.0004750942177666345
+    },
+    {
+      "k": 5,
+      "accuracy_media": 0.9371099518172017,
+      "accuracy_desviacion": 0.00621832930699187,
+      "precision_macro_media": 0.9377967527270472,
+      "recall_macro_media": 0.9346298484453271,
+      "f1_macro_media": 0.9347390588088107,
+      "f1_macro_desviacion": 0.0062905463070243575,
+      "roc_auc_macro_media": 0.9975084044428316,
+      "roc_auc_macro_desviacion": 0.0003047153830973297
+    }
+  ]
+}
