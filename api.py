@@ -29,6 +29,15 @@ from starlette.concurrency import run_in_threadpool
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 from tensorflow.keras.models import Model
 
+from gemma_semantica import (
+    CLASES_GEMMA,
+    TIPOS_CONTENIDO,
+    VISIBILIDADES,
+    ajustar_gemma_con_evidencia_visual,
+    decidir_estado_semantico,
+    normalizar_respuesta_gemma,
+)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = Path(os.getenv("TURISMO_MODEL_PATH", BASE_DIR / "models" / "modelo_mobilenetv2_limpio_final.keras"))
@@ -50,7 +59,7 @@ GEMMA_NUM_GPU = int(os.getenv("GEMMA_NUM_GPU", "0"))
 GEMMA_NUM_CTX = int(os.getenv("GEMMA_NUM_CTX", "2048"))
 GEMMA_NUM_BATCH = int(os.getenv("GEMMA_NUM_BATCH", "64"))
 GEMMA_TIMEOUT_SECONDS = float(os.getenv("GEMMA_TIMEOUT_SECONDS", "180"))
-MOTOR_VERSION = "2.2.0"
+MOTOR_VERSION = "2.3.0"
 
 CLASE_A_SUBTIPOS = {
     "bosque": ["bosques", "zonas paisajisticas", "zona paisajistica"],
@@ -66,10 +75,21 @@ CLASE_A_SUBTIPOS = {
 GEMMA_SCHEMA = {
     "type": "object",
     "properties": {
-        "clase": {"type": "string", "enum": CLASES + ["no_turistico", "dudoso"]},
-        "descripcion_breve": {"type": "string"},
+        "clase": {"type": "string", "enum": list(CLASES_GEMMA)},
+        "tipo_contenido": {"type": "string", "enum": list(TIPOS_CONTENIDO)},
+        "atractivo_visible": {"type": "boolean"},
+        "visibilidad": {"type": "string", "enum": list(VISIBILIDADES)},
+        "personas_como_contexto": {"type": "boolean"},
+        "descripcion_breve": {"type": "string", "minLength": 1},
     },
-    "required": ["clase", "descripcion_breve"],
+    "required": [
+        "clase",
+        "tipo_contenido",
+        "atractivo_visible",
+        "visibilidad",
+        "personas_como_contexto",
+        "descripcion_breve",
+    ],
     "additionalProperties": False,
 }
 
@@ -251,22 +271,70 @@ def validar_con_gemma(image_path: Path) -> dict[str, Any]:
             "disponible": False,
             "validacion": "DUDOSO",
             "clase": "dudoso",
+            "tipo_contenido": None,
+            "atractivo_visible": None,
+            "visibilidad": "nula",
+            "personas_como_contexto": False,
+            "descripcion_breve": "Gemma está deshabilitado por configuración.",
             "descripcion": "Gemma está deshabilitado por configuración.",
             "respuesta_cruda": "",
         }
 
     prompt = f"""
-Analiza solamente el contenido visual de la imagen y selecciona una sola clase
-dominante. No necesitas reconocer un lugar famoso ni comprobar su ubicación.
+Analiza la imagen completa para determinar si es una fotografía directa de un
+atractivo turístico natural. No reconozcas identidades, rostros ni personas
+concretas. Las personas solo pueden describirse como contexto o como oclusión.
 
-Clases permitidas: {', '.join(CLASES)}.
+Primero determina tipo_contenido:
+- captura_directa: fotografía tomada directamente de la escena real.
+- pantalla: se ve un monitor, laptop, celular, televisor o proyección mostrando
+  el paisaje.
+- documento: el paisaje aparece dentro de una página o documento.
+- contenido_impreso: fotografía, folleto, cartel, revista o imagen impresa.
+- otro_indirecto: cualquier otra representación del atractivo que no sea una
+  captura directa de la escena real.
 
+Evalúa visibilidad de forma conservadora:
+- alta: el atractivo está nítido, ocupa una parte importante de la imagen y no
+  presenta obstáculos relevantes.
+- media: el atractivo se distingue claramente, con desenfoque u obstáculos
+  leves que no impiden evaluarlo.
+- baja: existe desenfoque de movimiento evidente, oscuridad importante, o las
+  personas y objetos ocupan la mayor parte de la imagen y el atractivo solo se
+  observa parcialmente o al fondo.
+- nula: el atractivo no aparece o no puede verificarse visualmente.
+
+personas_como_contexto=true solamente cuando hay personas visibles y estas no
+impiden evaluar el atractivo. Si no aparece ninguna persona, usa false. Si una
+multitud o personas en primer plano ocultan casi todo el atractivo, no son solo
+contexto: usa personas_como_contexto=false, visibilidad=baja y clase=dudoso.
+
+Reglas obligatorias:
+1. Si el contenido principal es pantalla, documento, contenido_impreso u
+   otro_indirecto, asigna clase=no_turistico aunque dentro aparezca un paisaje.
+2. En una captura_directa, clasifica normalmente solo si el atractivo real es
+   visible con visibilidad alta o media.
+3. La presencia de una familia o personas como contexto no invalida la foto si
+   el atractivo sigue claramente visible. En ese caso usa
+   personas_como_contexto=true.
+4. Si personas u objetos ocultan casi todo el atractivo, o la imagen está muy
+   borrosa y no permite verificarlo, asigna clase=dudoso y visibilidad baja o
+   nula.
+5. Si no aparece ningún atractivo turístico real, asigna clase=no_turistico y
+   atractivo_visible=false.
+6. No identifiques ni describas rostros, edades, géneros o identidades.
+7. Una cascada o montaña todavía reconocible no implica visibilidad media o
+   alta. Si toda la escena muestra movimiento fuerte o falta de nitidez, usa
+   visibilidad=baja y clase=dudoso.
+
+Clases turísticas permitidas: {', '.join(CLASES)}.
 Usa bosque cuando predominen árboles o vegetación forestal aunque exista un
 arroyo. Usa lago solamente para una masa amplia de agua interior. Usa cascada
-cuando exista una caída visible de agua. Si no aparece ninguna clase permitida,
-usa no_turistico. Usa dudoso solamente cuando el contenido no permita decidir.
+cuando exista una caída visible de agua. Usa dudoso cuando la visibilidad u
+oclusión no permita decidir con seguridad.
 
-Responde únicamente con el objeto JSON solicitado.
+Devuelve exclusivamente el objeto JSON del esquema. descripcion_breve debe ser
+una descripción general de la escena, sin identificar personas.
 """.strip()
     try:
         respuesta = ollama_client.chat(
@@ -283,21 +351,10 @@ Responde únicamente con el objeto JSON solicitado.
         )
         texto = extraer_contenido_ollama(respuesta).strip()
         datos = json.loads(texto)
-        clase = normalizar_texto(datos.get("clase", "dudoso"))
-        descripcion = str(datos.get("descripcion_breve", "")).strip()
-        if clase not in set(CLASES) | {"no_turistico", "dudoso"}:
-            raise ValueError(f"Clase Gemma desconocida: {clase}")
-        if clase in CLASES:
-            validacion = "TURISTICO"
-        elif clase == "no_turistico":
-            validacion = "NO_TURISTICO"
-        else:
-            validacion = "DUDOSO"
+        resultado = normalizar_respuesta_gemma(datos)
         return {
             "disponible": True,
-            "validacion": validacion,
-            "clase": clase,
-            "descripcion": descripcion,
+            **resultado,
             "respuesta_cruda": texto,
         }
     except Exception as error:
@@ -305,6 +362,11 @@ Responde únicamente con el objeto JSON solicitado.
             "disponible": False,
             "validacion": "DUDOSO",
             "clase": "dudoso",
+            "tipo_contenido": None,
+            "atractivo_visible": None,
+            "visibilidad": "nula",
+            "personas_como_contexto": False,
+            "descripcion_breve": "No fue posible consultar o validar la respuesta de Gemma.",
             "descripcion": "No fue posible consultar o validar la respuesta de Gemma.",
             "respuesta_cruda": f"{type(error).__name__}: {error}",
         }
@@ -443,20 +505,9 @@ def decidir_estado(
     lugar: dict[str, Any] | None,
     score: int,
 ) -> tuple[str, str]:
-    if not gemma["disponible"]:
-        return (
-            "CASO_DUDOSO",
-            "CNN, embeddings y GIS fueron evaluados, pero Gemma no está disponible; no se emitirá una decisión automática completa.",
-        )
-    if gemma["validacion"] == "NO_TURISTICO":
-        if lugar and fusion["acuerdo_visual"] >= 2:
-            return (
-                "CASO_DUDOSO",
-                "Gemma considera la imagen no turística, pero existe evidencia visual y GIS; se requiere revisión.",
-            )
-        return "IMAGEN_NO_VALIDA", "Gemma no detectó un paisaje o atractivo turístico válido."
-    if gemma["validacion"] == "DUDOSO":
-        return "CASO_DUDOSO", "Gemma consideró ambigua la imagen."
+    estado_semantico = decidir_estado_semantico(gemma)
+    if estado_semantico is not None:
+        return estado_semantico
     if fusion["conflicto_gemma"]:
         return "CASO_DUDOSO", "Gemma y los clasificadores visuales no coinciden en la clase dominante."
     if lugar and fusion["acuerdo_visual"] >= 2 and score >= 70:
@@ -481,6 +532,7 @@ def procesar_imagen(file_bytes: bytes, filename: str, lat: float, lon: float, al
     try:
         visual = analizar_imagen(img_array)
         gemma = validar_con_gemma(temporal)
+        gemma = ajustar_gemma_con_evidencia_visual(gemma, visual["confianza_cnn"])
         fusion = fusionar_clases(visual, gemma)
         candidatos = buscar_gis(fusion["clase_final"], lat, lon, alt)
         lugar = elegir_lugar(candidatos)
