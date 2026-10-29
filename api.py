@@ -42,7 +42,7 @@ from gemma_semantica import (
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = Path(os.getenv("TURISMO_MODEL_PATH", BASE_DIR / "models" / "modelo_mobilenetv2_limpio_final.keras"))
 EMBEDDINGS_PATH = Path(os.getenv("TURISMO_EMBEDDINGS_PATH", BASE_DIR / "fewshot_db" / "embeddings_v2.pkl"))
-EXCEL_PATH = Path(os.getenv("TURISMO_GIS_PATH", BASE_DIR / "lugares_turisticos_app_final_v3.xlsx"))
+EXCEL_PATH = Path(os.getenv("TURISMO_GIS_PATH", BASE_DIR / "lugares_turisticos_app_final_v4.xlsx"))
 TEMP_DIR = BASE_DIR / "temp_uploads"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -59,7 +59,7 @@ GEMMA_NUM_GPU = int(os.getenv("GEMMA_NUM_GPU", "0"))
 GEMMA_NUM_CTX = int(os.getenv("GEMMA_NUM_CTX", "2048"))
 GEMMA_NUM_BATCH = int(os.getenv("GEMMA_NUM_BATCH", "64"))
 GEMMA_TIMEOUT_SECONDS = float(os.getenv("GEMMA_TIMEOUT_SECONDS", "180"))
-MOTOR_VERSION = "2.3.0"
+MOTOR_VERSION = "2.4.0"
 
 CLASE_A_SUBTIPOS = {
     "bosque": ["bosques", "zonas paisajisticas", "zona paisajistica"],

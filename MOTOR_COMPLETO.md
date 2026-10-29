@@ -1,4 +1,4 @@
-# Motor IA de turismo 2.2
+# Motor IA de turismo 2.4
 
 El motor combina cuatro fuentes de evidencia:
 
@@ -11,7 +11,7 @@ El motor combina cuatro fuentes de evidencia:
 
 - Modelo: `models/modelo_mobilenetv2_limpio_final.keras`
 - Embeddings: `fewshot_db/embeddings_v2.pkl`
-- GIS: `lugares_turisticos_app_final_v3.xlsx`
+- GIS: `lugares_turisticos_app_final_v4.xlsx` (coordenadas auditadas contra SIGMINCETUR)
 - API: `api.py`
 
 Las clases son: bosque, cascada, desierto, lago, montana, nevado, playa y

@@ -74,7 +74,7 @@ Tambien puede probarse una imagen colocada en `imagenes_prueba`:
 - `api.py`
 - `models/modelo_mobilenetv2_limpio_final.keras`
 - `fewshot_db/embeddings_v2.pkl`
-- `lugares_turisticos_app_final_v3.xlsx`
+- `lugares_turisticos_app_final_v4.xlsx` (530 registros auditados contra SIGMINCETUR)
 - `requirements-api.txt`
 - `Dockerfile`
 - `docker-compose.yml`

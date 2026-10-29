@@ -21,7 +21,7 @@ RUN mkdir -p /app/models /app/fewshot_db /app/temp_uploads \
 COPY api.py /app/api.py
 COPY models/modelo_mobilenetv2_limpio_final.keras /app/models/
 COPY fewshot_db/embeddings_v2.pkl /app/fewshot_db/
-COPY lugares_turisticos_app_final_v3.xlsx /app/
+COPY lugares_turisticos_app_final_v4.xlsx /app/
 
 RUN chown -R appuser:appuser /app
 USER appuser
